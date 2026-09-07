@@ -1,0 +1,10 @@
+[package]
+name = "comms_link"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "comms_link"
+path = "src/main.rs"
+
+[dependencies]
