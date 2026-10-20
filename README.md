@@ -12,29 +12,6 @@ A software simulation of mission computing and resilient communications, impleme
 
 **[Read the full report in GitHub's PDF viewer](docs/comms-technical-paper.pdf)** · [Download PDF](docs/comms-technical-paper.pdf?raw=true) · [LaTeX source](docs/comms-technical-paper.tex)
 
-<details>
-<summary><strong>Preview the report: abstract, results, and scope</strong></summary>
-
-### Abstract
-
-The report examines a mission-computer simulation and a separate communications simulator implemented in C++20, C11, and Rust. It describes IMU/GNSS estimation, A* planning, PID command generation, watchdog supervision, sequenced message delivery, and score-based link failover. Evaluation combines source inspection with numerical analysis of committed outputs at a fixed repository revision.
-
-### Results at a glance
-
-| Evaluation | Recorded result |
-|---|---|
-| Fault-scenario final-state checks | 500 / 500 satisfied across four fault classes |
-| Position estimation | 0.138 m planar RMSE across 1,500 trajectory samples |
-| Communications failover | 22–41 ms simulated switching latency across 20 trials |
-
-### Scope and findings
-
-The report includes the architecture, estimator equations, algorithm choices, evaluation method, reproducibility commands, and a verification roadmap. It also documents the current actuation, integration, probability-model, and test-coverage limitations. Results describe archived software simulations; the executables were not independently rerun for the report.
-
-[Continue to the complete PDF](docs/comms-technical-paper.pdf)
-
-</details>
-
 ## Recorded results
 
 The following values describe the committed artifacts at revision [`e04681f`](https://github.com/tyreefranklinjr/Mission-Computer--Communications-Platform/tree/e04681fdf181b30d5230861b9ff7cf7fef1f30c1). They are archived simulation results, not measurements from physical hardware. The numerical summaries below were recalculated from those CSV files; the executables were not rerun for this documentation update.
