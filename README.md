@@ -1,115 +1,170 @@
-# Resilient Autonomous Mission Computer and Degraded-Communications Platform
+# Resilient Autonomous Mission Computer and Communications Simulator
 
-A software simulation of a distributed embedded autonomy system: sensor fusion, motion
-planning, watchdog-driven mission safing, and a fault-tolerant communications layer with
-automatic failover. Runs as ordinary Linux processes, the same way the author's companion
-SDR project simulates IQ samples instead of driving a real radio. See
-[Simulation notes](#simulation-notes) for exactly what is and is not real hardware.
+A software simulation of mission computing and resilient communications, implemented in C++20, C11, and Rust. The mission computer combines IMU/GNSS sensor fusion, A* route planning, PID command generation, and watchdog-driven mission-state management. A separate Rust simulator evaluates sequenced message delivery and automatic link failover during a primary-link outage.
 
-**Stack:** C++20, C, Rust, FreeRTOS-style scheduling pattern, ESP32-C3 (target architecture only,
-not present), CAN/TWAI (simulated), I2C/UART (as message-passing pattern), EKF, PID, A*, Docker, Linux
+**Technologies:** C++20, C11, Rust, Python, CMake, Cargo, Linux, Docker build configuration.
 
-## Results (from real runs of this code)
+**Algorithms and systems:** Kalman filtering, A* search, PID control, bounded message queues, heartbeat monitoring, fault injection, acknowledgement timeouts, and duplicate suppression.
 
-| Metric | Result | How it was measured |
+## Recorded results
+
+The following values describe the committed artifacts at revision [`e04681f`](https://github.com/tyreefranklinjr/Mission-Computer--Communications-Platform/tree/e04681fdf181b30d5230861b9ff7cf7fef1f30c1). They are archived simulation results, not measurements from physical hardware. The numerical summaries below were recalculated from those CSV files; the executables were not rerun for this documentation update.
+
+| Metric | Result | Evidence |
 |---|---|---|
-| Fault-sweep safe-state transition success | **100.00% (500 / 500)** | `mission_computer fault-sweep 500`, all 4 fault classes |
-| comms_link failover latency | **22-41 ms** (target: < 250 ms), all 20 trials pass | `comms_link/run_failover_trials.sh`, 20 seeded runs |
-| EKF vs. simulated true position error | typically < 0.3 m | `mission_computer sim`, logged every 50 ticks |
-| Mission computer scheduler rate | 50 Hz (20 ms fixed tick) | `src/main.cpp` tick loop |
-| Fault-sweep wall-clock runtime | ~0.07 s for 500 scenarios | measured on this machine |
+| Fault-scenario final-state checks | **500 / 500 passed** across four fault classes | [`fault_sweep_results.csv`](samples/fault_sweep_results.csv) |
+| Planar position RMSE | **0.138 m** across 1,500 samples | [`ekf_trajectory.csv`](samples/ekf_trajectory.csv) |
+| Position error below 0.3 m | **1,490 / 1,500 samples (99.33%)** | Full recorded trajectory, including initialization |
+| Link-switching latency | **22–41 ms simulated**, mean **39 ms**; all 20 recorded trials below 250 ms | [`comms_link_failover_latencies.csv`](samples/comms_link_failover_latencies.csv) |
+| Mission simulation step | **20 ms**, equivalent to a **50 Hz logical execution rate** | [`src/main.cpp`](src/main.cpp) |
 
-Full per-scenario data is committed in `samples/`. `assets/dashboard.png` below was generated
-from that data by `python/generate_report.py`.
+The fault-sweep result includes 311 scenarios expected to enter `SAFE_STOP` and 189 expected to avoid it. It does not represent 500 safe-stop transitions. The existing checks evaluate the final mission state; they do not verify actuator inhibition or physical stopping.
 
-![dashboard](assets/dashboard.png)
+The latency results measure the interval from primary-link outage onset to link selection. They do not measure hardware switching time or the time to the first successful application delivery. The current probability-model limitation is described under [Known limitations](#known-limitations).
 
-## How to build and run
+![Simulation dashboard showing trajectory estimation, fault-sweep outcomes, and communications failover results](assets/dashboard.png)
 
-### C++ / C mission computer
+The dashboard is generated from `samples/` by [`python/generate_report.py`](python/generate_report.py). The CSV files are the source of the tabulated results.
+
+## Architecture
+
+### Mission computer: C++ and C
+
+One process executes four logical nodes sequentially on each simulated tick.
+
+| Node | Responsibility | Main implementation |
+|---|---|---|
+| Sensor | Advance the scripted trajectory and publish noisy IMU/GNSS readings and a heartbeat | `imu_gnss_sim.hpp`, `main.cpp` |
+| Navigation | Estimate planar position and velocity; plan routes on a 20 × 20 occupancy grid | `ekf.hpp`, `astar.hpp` |
+| Control | Calculate a saturated PID command from the bearing to the next waypoint | `pid.hpp`, `main.cpp` |
+| Supervisor | Check heartbeat freshness and GNSS availability; update the mission state | `watchdog.hpp`, `mission_state.hpp` |
+
+The estimator maintains `[x, y, vx, vy]`. Although its class is named `Ekf`, the implemented motion and measurement models are linear. State prediction uses IMU acceleration; correction uses GNSS position. Matrix operations use fixed-size arrays.
+
+A* uses four-connected, unit-cost moves and a Euclidean heuristic. Its frontier is a vector scanned for the lowest score. The mission maps grid coordinates to 2 m increments and requests replanning every 250 ticks, or whenever no path has been established.
+
+The messaging layer is a standalone C library linked through `extern "C"`. It provides a 64-frame FIFO ring buffer with eight-byte payloads, bounded storage, and a dropped-message counter. Frame priority is metadata; the queue does not simulate CAN arbitration.
+
+The supervisor advances through `INIT -> CALIBRATING -> AUTONOMOUS`. A communications outage can select `DEGRADED`, with recovery to `AUTONOMOUS` when the outage clears. An unhealthy core-system indication selects the terminal `SAFE_STOP` state.
+
+### Communications simulator: Rust
+
+`comms_link/` is an independent executable with:
+
+- A `BinaryHeap` outgoing queue ordered by priority, then sequence number.
+- Sequence tracking and receiver-side duplicate suppression.
+- Acknowledgements, a 20 ms simulated timeout, and at most five total transmission attempts per message.
+- A six-outcome rolling success score for each link.
+- Automatic primary-to-secondary failover when the primary score falls below 0.5 after at least three recorded outcomes.
+- A 30 s simulated primary-link outage within a 40 s scenario.
+
+The Rust executable does not carry messages from the C++ mission computer. Its measurements describe a separate communications experiment.
+
+## Build and run
+
+### Requirements
+
+- A C11 and C++20 compiler.
+- CMake 3.16 or newer and a supported build tool.
+- Rust and Cargo.
+- Python 3 and the packages in `python/requirements.txt` for dashboard generation.
+- Bash for the communications trial script.
+
+Run the following commands from the repository root unless indicated otherwise.
+
+### Mission computer
 
 ```bash
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+ctest --test-dir build --output-on-failure
 
-./build/test_ekf
-./build/test_astar
-
-./build/mission_computer sim samples/ekf_trajectory.csv
-./build/mission_computer fault-sweep 500 samples/fault_sweep_results.csv
+mkdir -p evaluation
+./build/mission_computer sim evaluation/trajectory.csv
+./build/mission_computer fault-sweep 500 evaluation/faults.csv
 ```
 
-### Rust comms_link
+`sim` executes 1,500 ticks, representing 30 s of simulated motion. `fault-sweep` creates a fresh 500-tick mission for each scenario. Outputs in `evaluation/` keep these runs separate from the committed baseline.
+
+### Communications simulator
 
 ```bash
 cd comms_link
-cargo build --release
-./target/release/comms_link       # one run, writes samples/comms_link_log.csv
-./run_failover_trials.sh          # 20 seeded runs
+cargo build --release --locked
+./target/release/comms_link
+bash run_failover_trials.sh
 ```
+
+The default seed-7 run writes `../samples/comms_link_log.csv`. The trial script runs 20 seeds and writes `../samples/comms_link_failover_latencies.csv`. These commands replace the corresponding baseline files, so use a disposable checkout when preserving archived results matters.
 
 ### Dashboard
 
+From the repository root:
+
 ```bash
-pip install -r python/requirements.txt
+python3 -m pip install -r python/requirements.txt
 python3 python/generate_report.py
 ```
+
+The report script reads `samples/*.csv` and replaces `assets/dashboard.png`. It does not automatically read the separate `evaluation/` outputs.
 
 ### Docker
 
 ```bash
 docker build -t autonomy_platform .
-docker run autonomy_platform sim
-docker run autonomy_platform fault-sweep 500
+docker run --rm autonomy_platform sim
+docker run --rm autonomy_platform fault-sweep 500
 ```
 
-## Architecture
+The Dockerfile is included as build configuration. The repository's development notes report that it was hand-reviewed without a live Docker daemon; this documentation update does not establish a successful container build.
 
-Four simulated nodes, each stepped once per 20 ms tick by a fixed-rate scheduler in
-`src/main.cpp`, communicating over a simulated CAN/TWAI bus:
+## Fault injection and verification
 
-- **Sensor node** generates simulated IMU/GNSS readings (`imu_gnss_sim.hpp`) and publishes them as CAN frames.
-- **Navigation node** runs the EKF (`ekf.hpp`) to fuse IMU + GNSS into a position/velocity estimate, and A* (`astar.hpp`) to plan a path around an obstacle grid.
-- **Control node** runs a PID controller (`pid.hpp`) to steer toward the next waypoint.
-- **Supervisor node** watches heartbeats (`watchdog.hpp`) and drives the mission state machine (`mission_state.hpp`): `INIT -> CALIBRATING -> AUTONOMOUS`, dropping to `DEGRADED` on a comms outage or `SAFE_STOP` on an unrecovered fault.
+`fault_injector.hpp` derives fault type, injection time, duration, and expected outcome from the scenario number. The harness covers GNSS dropout, CAN publication failure, network outage, and skipped control-task execution.
 
-The simulated CAN/TWAI bus (`can_bus.h`/`can_bus.c`) is a standalone C library: a fixed-size
-ring buffer of `{id, priority, 8-byte payload}` frames, linked into C++ via `extern "C"`.
+| Fault case | Recorded scenarios | Expected behavior | Recorded reaction interval |
+|---|---:|---|---|
+| CAN publication failure | 125 | Enter `SAFE_STOP` | 5 ticks / 100 ms |
+| Skipped control task | 125 | Enter `SAFE_STOP` | 5 ticks / 100 ms |
+| Long GNSS dropout | 61 | Enter `SAFE_STOP` | 40 ticks / 800 ms |
+| Short GNSS dropout | 64 | Avoid `SAFE_STOP` | Not applicable |
+| Network outage | 125 | Avoid `SAFE_STOP` | Not applicable |
 
-`fault_injector.hpp` deterministically generates fault scenarios (sensor dropout, CAN bus
-fault, network outage, task hang) from a scenario number, so `fault-sweep` is fully
-reproducible; `metrics.hpp` logs each scenario's expected vs. actual outcome to CSV.
+Reaction intervals start at the injection tick. The watchdog becomes unhealthy when heartbeat age exceeds five ticks. The five-tick recorded delay begins with the first omitted heartbeat, one tick after the last successful heartbeat. GNSS safing occurs on the forty-first consecutive missing sample, 40 tick intervals after the first missing sample.
 
-`comms_link/` is a separate Rust binary demonstrating the fault-tolerant communications story
-on its own: sequence tracking, ACK/retry, duplicate suppression, per-link success-rate scoring,
-a `BinaryHeap` priority queue, and automatic failover during a simulated 30 s outage.
+The CTest targets exercise estimator convergence and small-grid planning. The fault sweep checks final states. For tolerated faults, either `AUTONOMOUS` or `DEGRADED` is accepted, so passing does not independently prove a complete degrade-and-recover sequence.
 
 ## Simulation notes
 
-This runs entirely as ordinary processes on a regular Linux machine:
+- Time advances through logical loop iterations. The 50 Hz mission rate and millisecond communications timings do not establish wall-clock deadline compliance.
+- All logical mission nodes execute in one process. Skipping the control function models missing work and heartbeats, rather than a real task blocking its scheduler.
+- Sensor readings are generated from scripted motion plus noise. Physical sensors, radios, ESP32-C3 hardware, and FreeRTOS are outside the current implementation.
+- The in-memory message queue models CAN-style frames without physical timing, arbitration, or transceiver behavior.
 
-- No physical ESP32-C3 or CAN transceiver. `can_bus.c` is a RAM ring buffer, not a TWAI driver.
-- FreeRTOS itself is not used. The "50 Hz scheduling" is a fixed-rate scheduler in plain C++, modeled on FreeRTOS's periodic task pattern.
-- IMU/GNSS readings come from a scripted trajectory plus noise, not real sensors.
-- The "30 s outage" in `comms_link` uses a virtual millisecond clock, not wall-clock time; the whole scenario finishes in under a second of real runtime, and the program says so in its own output.
-- The Dockerfile was hand-reviewed but not built against a live Docker daemon (none was available in this environment).
+## Known limitations
 
-This is an honest simulation of the architecture and behavior in the resume bullets above it,
-built and measured on Linux, not a claim of code running on physical embedded hardware.
+- **Actuation and control:** `SAFE_STOP` is a latched mission-state decision, but it does not inhibit actuator-command generation. PID output does not drive the scripted trajectory, and its input is a waypoint bearing without subtraction of vehicle heading. Closed-loop tracking and stopping behavior have not been demonstrated.
+- **Communications probabilities:** The Rust generator retains 31 random bits but divides by a 32-bit maximum, producing values approximately in `[0, 0.5)`. Configured loss and late-arrival thresholds therefore differ from their intended probabilities. The archived results describe this implementation; correcting the generator requires a new baseline.
+- **Recovery and replay:** The inactive primary has no explicit health-probing mechanism for failback. Randomized `HashMap` iteration can also affect the order in which resolved outcomes enter the score history, so a fixed seed alone does not guarantee identical event traces.
+- **Load and coverage:** The Rust loop drains its outgoing queue without a bandwidth constraint. Priority ordering does not establish performance under congestion. Existing tests also leave gaps in actuator inhibition, transition deadlines, queue saturation, grid-dimension validation, and complete path-adjacency checks.
+
+The next verification steps are to connect safing to actuation, correct and rebaseline the communications model, assert transition sequences and deadlines, and integrate the two executables through an explicit message interface.
 
 ## Repository layout
 
-```
-src/            C++20 mission computer: EKF, PID, A*, watchdog, mission state machine,
-                fault injector, plus can_bus.h/.c (the C piece)
-tests/          test_ekf.cpp, test_astar.cpp
-comms_link/     standalone Rust crate: fault-tolerant communications simulation
-python/         generate_report.py, builds assets/dashboard.png from samples/*.csv
-samples/        real CSV output from actual runs (not fabricated)
-assets/         assets/dashboard.png, generated by python/generate_report.py
-```
+| Path | Contents |
+|---|---|
+| `src/` | Mission computer, estimator, planner, controller, watchdog, state machine, fault injection, and C message queue |
+| `tests/` | Estimator and A* test executables |
+| `comms_link/` | Rust communications simulator and seeded trial script |
+| `python/` | Dashboard generation and Python requirements |
+| `samples/` | Committed trajectory, fault-sweep, communications event, and latency CSV files |
+| `assets/` | Generated simulation dashboard |
 
 ## Development notes
 
-Only the files under `tests/` and `python/` were AI-assisted (Claude). Everything under
-`src/` and `comms_link/src/` was written and debugged without AI assistance.
+Only the files under `tests/` and `python/` were AI-assisted (Claude). Everything under `src/` and `comms_link/src/` was written and debugged without AI assistance. This README revision was prepared with AI assistance.
+
+## License
+
+[MIT](LICENSE).
